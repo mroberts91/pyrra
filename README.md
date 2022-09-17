@@ -1,3 +1,4 @@
+<!-- Trigger PR -->
 <p align="center">
   <img src="ui/src/logo.svg" alt="Pyrra: SLOs with Prometheus" height="75">
 </p>
