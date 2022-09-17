@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"time"
 
 	kitlog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -68,6 +69,22 @@ func (r *ServiceLevelObjectiveReconciler) reconcilePrometheusRule(ctx context.Co
 	newRule, err := makePrometheusRule(kubeObjective)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	var beforeRule monitoringv1.PrometheusRule
+	if err := r.Get(ctx, req.NamespacedName, &beforeRule); err != nil {
+		if errors.IsNotFound(err) {
+			level.Info(logger).Log("msg", "creating prometheus rule before sleep", "namespace", beforeRule.GetNamespace(), "name", beforeRule.GetName())
+		}
+	}
+
+	time.Sleep(10 * time.Second)
+
+	var afterRule monitoringv1.PrometheusRule
+	if err := r.Get(ctx, req.NamespacedName, &afterRule); err != nil {
+		if errors.IsNotFound(err) {
+			level.Info(logger).Log("msg", "creating prometheus rule after sleep", "namespace", afterRule.GetNamespace(), "name", afterRule.GetName())
+		}
 	}
 
 	var rule monitoringv1.PrometheusRule
