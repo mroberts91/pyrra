@@ -23,6 +23,4 @@ bin
 *~
 
 /pyrra
-
-# dist folder
-/dist
+node_modules

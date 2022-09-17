@@ -18,18 +18,14 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"os"
 
-	"github.com/bufbuild/connect-go"
 	"github.com/go-kit/log"
 	"github.com/oklog/run"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
@@ -39,8 +35,8 @@ import (
 
 	pyrrav1alpha1 "github.com/pyrra-dev/pyrra/kubernetes/api/v1alpha1"
 	"github.com/pyrra-dev/pyrra/kubernetes/controllers"
-	objectivesv1alpha1 "github.com/pyrra-dev/pyrra/proto/objectives/v1alpha1"
-	"github.com/pyrra-dev/pyrra/proto/objectives/v1alpha1/objectivesv1alpha1connect"
+	"github.com/pyrra-dev/pyrra/openapi"
+	openapiserver "github.com/pyrra-dev/pyrra/openapi/server/go"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -82,15 +78,11 @@ func cmdKubernetes(logger log.Logger, metricsAddr string, configMapMode bool) in
 
 	var gr run.Group
 	{
-		router := http.NewServeMux()
-		router.Handle(objectivesv1alpha1connect.NewObjectiveBackendServiceHandler(&KubernetesObjectiveServer{
-			client: mgr.GetClient(),
-		}))
+		router := openapiserver.NewRouter(
+			openapiserver.NewObjectivesApiController(&ObjectiveServer{client: mgr.GetClient()}),
+		)
 
-		server := http.Server{
-			Addr:    ":9444",
-			Handler: h2c.NewHandler(router, &http2.Server{}),
-		}
+		server := http.Server{Addr: ":9444", Handler: router}
 
 		gr.Add(func() error {
 			return server.ListenAndServe()
@@ -115,22 +107,22 @@ type KubernetesClient interface {
 	List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error
 }
 
-type KubernetesObjectiveServer struct {
+type ObjectiveServer struct {
 	client KubernetesClient
 }
 
-func (s *KubernetesObjectiveServer) List(ctx context.Context, req *connect.Request[objectivesv1alpha1.ListRequest]) (*connect.Response[objectivesv1alpha1.ListResponse], error) {
+func (o *ObjectiveServer) ListObjectives(ctx context.Context, expr string) (openapiserver.ImplResponse, error) {
 	var (
 		matchers         []*labels.Matcher
 		nameMatcher      *labels.Matcher
 		namespaceMatcher *labels.Matcher
 	)
 
-	if req.Msg.Expr != "" {
+	if expr != "" {
 		var err error
-		matchers, err = parser.ParseMetricSelector(req.Msg.Expr)
+		matchers, err = parser.ParseMetricSelector(expr)
 		if err != nil {
-			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("failed to parse expr: %w", err))
+			return openapiserver.ImplResponse{Code: http.StatusBadRequest}, err
 		}
 		for _, m := range matchers {
 			if m.Name == labels.MetricName {
@@ -151,11 +143,11 @@ func (s *KubernetesObjectiveServer) List(ctx context.Context, req *connect.Reque
 	}
 
 	var list pyrrav1alpha1.ServiceLevelObjectiveList
-	if err := s.client.List(ctx, &list, &listOpts); err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+	if err := o.client.List(ctx, &list, &listOpts); err != nil {
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
-	objectives := make([]*objectivesv1alpha1.Objective, 0, len(list.Items))
+	objectives := make([]openapiserver.Objective, 0, len(list.Items))
 	for _, s := range list.Items {
 		if nameMatcher != nil {
 			if !nameMatcher.Matches(s.GetName()) {
@@ -170,12 +162,33 @@ func (s *KubernetesObjectiveServer) List(ctx context.Context, req *connect.Reque
 
 		internal, err := s.Internal()
 		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, err)
+			return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 		}
-		objectives = append(objectives, objectivesv1alpha1.FromInternal(internal))
+		objectives = append(objectives, openapi.ServerFromInternal(internal))
 	}
 
-	return connect.NewResponse(&objectivesv1alpha1.ListResponse{
-		Objectives: objectives,
-	}), nil
+	return openapiserver.ImplResponse{
+		Code: http.StatusOK,
+		Body: objectives,
+	}, nil
+}
+
+func (o *ObjectiveServer) GetMultiBurnrateAlerts(ctx context.Context, expr, grouping string, inactive, current bool) (openapiserver.ImplResponse, error) {
+	return openapiserver.ImplResponse{}, errEndpointNotImplemented
+}
+
+func (o *ObjectiveServer) GetObjectiveErrorBudget(ctx context.Context, expr, grouping string, start, end int32) (openapiserver.ImplResponse, error) {
+	return openapiserver.ImplResponse{}, errEndpointNotImplemented
+}
+
+func (o *ObjectiveServer) GetObjectiveStatus(ctx context.Context, expr, grouping string) (openapiserver.ImplResponse, error) {
+	return openapiserver.ImplResponse{}, errEndpointNotImplemented
+}
+
+func (o *ObjectiveServer) GetREDErrors(ctx context.Context, expr, grouping string, start, end int32) (openapiserver.ImplResponse, error) {
+	return openapiserver.ImplResponse{}, errEndpointNotImplemented
+}
+
+func (o *ObjectiveServer) GetREDRequests(ctx context.Context, expr, grouping string, start, end int32) (openapiserver.ImplResponse, error) {
+	return openapiserver.ImplResponse{}, errEndpointNotImplemented
 }

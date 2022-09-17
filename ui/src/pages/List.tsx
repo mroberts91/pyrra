@@ -9,24 +9,21 @@ import {
   Row,
   Spinner,
   Table,
-  Tooltip as OverlayTooltip,
+  Tooltip as OverlayTooltip
 } from 'react-bootstrap'
+import {
+  Configuration,
+  MultiBurnrateAlert,
+  MultiBurnrateAlertStateEnum,
+  Objective,
+  ObjectivesApi,
+  ObjectiveStatus
+} from '../client'
 import {API_BASEPATH, formatDuration} from '../App'
 import {Link, useLocation, useNavigate} from 'react-router-dom'
 import Navbar from '../components/Navbar'
 import {IconArrowDown, IconArrowUp, IconArrowUpDown, IconWarning} from '../components/Icons'
-import {Labels, labelsString, MetricName, parseLabels} from '../labels'
-import {createConnectTransport, createPromiseClient} from '@bufbuild/connect-web'
-import {ObjectiveService} from '../proto/objectives/v1alpha1/objectives_connectweb'
-import {
-  Alert as ObjectiveAlert,
-  Alert_State,
-  GetAlertsResponse,
-  GetStatusResponse,
-  ListResponse,
-  Objective,
-  ObjectiveStatus,
-} from '../proto/objectives/v1alpha1/objectives_pb'
+import {Labels, labelsString, MetricName, parseLabels} from "../labels";
 
 enum TableObjectiveState {
   Unknown,
@@ -36,8 +33,7 @@ enum TableObjectiveState {
 }
 
 // TableObjective extends Objective to add some more additional (async) properties
-interface TableObjective {
-  objective: Objective
+interface TableObjective extends Objective {
   lset: string
   groupingLabels: Labels
   state: TableObjectiveState
@@ -53,7 +49,7 @@ interface TableAvailability {
 }
 
 interface TableState {
-  objectives: {[key: string]: TableObjective}
+  objectives: { [key: string]: TableObjective }
 }
 
 enum TableActionType {
@@ -67,19 +63,13 @@ enum TableActionType {
 }
 
 type TableAction =
-  | {type: TableActionType.SetObjective; lset: string; objective: Objective}
-  | {type: TableActionType.DeleteObjective; lset: string}
-  | {type: TableActionType.SetStatus; lset: string; status: ObjectiveStatus}
-  | {
-      type: TableActionType.SetObjectiveWithStatus
-      lset: string
-      statusLabels: Labels
-      objective: Objective
-      status: ObjectiveStatus
-    }
-  | {type: TableActionType.SetStatusNone; lset: string}
-  | {type: TableActionType.SetStatusError; lset: string}
-  | {type: TableActionType.SetAlert; labels: Labels; severity: string}
+  | { type: TableActionType.SetObjective, lset: string, objective: Objective }
+  | { type: TableActionType.DeleteObjective, lset: string }
+  | { type: TableActionType.SetStatus, lset: string, status: ObjectiveStatus }
+  | { type: TableActionType.SetObjectiveWithStatus, lset: string, statusLabels: Labels, objective: Objective, status: ObjectiveStatus }
+  | { type: TableActionType.SetStatusNone, lset: string }
+  | { type: TableActionType.SetStatusError, lset: string }
+  | { type: TableActionType.SetAlert, labels: Labels, severity: string }
 
 const tableReducer = (state: TableState, action: TableAction): TableState => {
   switch (action.type) {
@@ -88,20 +78,24 @@ const tableReducer = (state: TableState, action: TableAction): TableState => {
         objectives: {
           ...state.objectives,
           [action.lset]: {
-            objective: action.objective,
             lset: action.lset,
+            labels: action.objective.labels,
             groupingLabels: {},
+            description: action.objective.description,
+            window: action.objective.window,
+            target: action.objective.target,
+            config: action.objective.config,
             state: TableObjectiveState.Unknown,
             severity: null,
             availability: undefined,
-            budget: undefined,
-          },
-        },
+            budget: undefined
+          }
+        }
       }
     case TableActionType.DeleteObjective: {
       const {[action.lset]: _, ...cleanedObjective} = state.objectives
       return {
-        objectives: {...cleanedObjective},
+        objectives: {...cleanedObjective}
       }
     }
     case TableActionType.SetStatus:
@@ -112,17 +106,17 @@ const tableReducer = (state: TableState, action: TableAction): TableState => {
             ...state.objectives[action.lset],
             state: TableObjectiveState.Success,
             availability: {
-              errors: action.status.availability?.errors ?? 0,
-              total: action.status.availability?.total ?? 0,
-              percentage: action.status.availability?.percentage ?? 0,
+              errors: action.status.availability.errors,
+              total: action.status.availability.total,
+              percentage: action.status.availability.percentage
             },
-            budget: action.status.budget?.remaining,
-          },
-        },
+            budget: action.status.budget?.remaining
+          }
+        }
       }
     case TableActionType.SetObjectiveWithStatus: {
       // It is possible that we may need to merge some previous state
-      let severity: string | null = null
+      let severity: string | null = null;
       const o = state.objectives[action.lset]
       if (o !== undefined) {
         severity = o.severity
@@ -132,19 +126,23 @@ const tableReducer = (state: TableState, action: TableAction): TableState => {
         objectives: {
           ...state.objectives,
           [action.lset]: {
-            objective: action.objective,
             lset: action.lset,
+            labels: action.objective.labels,
             groupingLabels: action.statusLabels,
+            description: action.objective.description,
+            window: action.objective.window,
+            target: action.objective.target,
+            config: action.objective.config,
             state: TableObjectiveState.Success,
             severity: severity,
             availability: {
-              errors: action.status.availability?.errors ?? 0,
-              total: action.status.availability?.total ?? 0,
-              percentage: action.status.availability?.percentage ?? 0,
+              errors: action.status.availability.errors,
+              total: action.status.availability.total,
+              percentage: action.status.availability.percentage
             },
-            budget: action.status.budget?.remaining,
-          },
-        },
+            budget: action.status.budget?.remaining
+          }
+        }
       }
     }
     case TableActionType.SetStatusNone:
@@ -155,9 +153,9 @@ const tableReducer = (state: TableState, action: TableAction): TableState => {
             ...state.objectives[action.lset],
             state: TableObjectiveState.NoData,
             availability: null,
-            budget: null,
-          },
-        },
+            budget: null
+          }
+        }
       }
     case TableActionType.SetStatusError:
       return {
@@ -167,14 +165,14 @@ const tableReducer = (state: TableState, action: TableAction): TableState => {
             ...state.objectives[action.lset],
             state: TableObjectiveState.Error,
             availability: null,
-            budget: null,
-          },
-        },
+            budget: null
+          }
+        }
       }
     case TableActionType.SetAlert: {
       // Find the objective this alert's labels is the super set for.
       const result = Object.entries(state.objectives).find(([, o]) => {
-        const allLabels: Labels = {...o.objective.labels, ...o.groupingLabels}
+        const allLabels: Labels = {...o.labels, ...o.groupingLabels}
 
         let isSuperset = true
         Object.entries(action.labels).forEach(([k, v]) => {
@@ -203,9 +201,9 @@ const tableReducer = (state: TableState, action: TableAction): TableState => {
           ...state.objectives,
           [lset]: {
             ...state.objectives[lset],
-            severity: action.severity,
-          },
-        },
+            severity: action.severity
+          }
+        }
       }
     }
     default:
@@ -222,10 +220,7 @@ enum TableSortType {
   Alerts,
 }
 
-enum TableSortOrder {
-  Ascending,
-  Descending,
-}
+enum TableSortOrder {Ascending, Descending}
 
 interface TableSorting {
   type: TableSortType
@@ -233,13 +228,8 @@ interface TableSorting {
 }
 
 const List = () => {
-  const client = useMemo(() => {
-    return createPromiseClient(
-      ObjectiveService,
-      createConnectTransport({
-        baseUrl: API_BASEPATH,
-      }),
-    )
+  const api = useMemo(() => {
+    return new ObjectivesApi(new Configuration({basePath: API_BASEPATH}))
   }, [])
 
   const navigate = useNavigate()
@@ -250,7 +240,7 @@ const List = () => {
   const [table, dispatchTable] = useReducer(tableReducer, initialTableState)
   const [tableSortState, setTableSortState] = useState<TableSorting>({
     type: TableSortType.Budget,
-    order: TableSortOrder.Ascending,
+    order: TableSortOrder.Ascending
   })
 
   const [filterLabels, filterError] = useMemo((): [Labels, boolean] => {
@@ -300,11 +290,10 @@ const List = () => {
   useEffect(() => {
     document.title = 'Objectives - Pyrra'
 
-    client
-      .list({expr: labelsString(filterLabels)})
-      .then((resp: ListResponse) => setObjectives(resp.objectives))
+    api.listObjectives({ expr: labelsString(filterLabels) })
+      .then((objectives: Objective[]) => setObjectives(objectives))
       .catch((err) => console.log(err))
-  }, [client, filterLabels])
+  }, [api, filterLabels])
 
   useEffect(() => {
     // const controller = new AbortController()
@@ -316,20 +305,11 @@ const List = () => {
     // TODO: This is prone to a concurrency race with updates of status that have additional groupings...
     // One solution would be to store this in a separate array and reconcile against that array after every status update.
     if (objectives.length > 0) {
-      client
-        .getAlerts({
-          expr: '',
-          inactive: false,
-          current: false,
-        })
-        .then((resp: GetAlertsResponse) => {
-          resp.alerts.forEach((a: ObjectiveAlert) => {
-            if (a.state === Alert_State.firing) {
-              dispatchTable({
-                type: TableActionType.SetAlert,
-                labels: a.labels,
-                severity: a.severity,
-              })
+      api.getMultiBurnrateAlerts({expr: '', inactive: false, current: false})
+        .then((alerts: MultiBurnrateAlert[]) => {
+          alerts.forEach((alert: MultiBurnrateAlert) => {
+            if (alert.state === MultiBurnrateAlertStateEnum.Firing) {
+              dispatchTable({type: TableActionType.SetAlert, labels: alert.labels, severity: alert.severity})
             }
           })
         })
@@ -337,32 +317,22 @@ const List = () => {
     }
 
     objectives
-      .sort((a: Objective, b: Objective) =>
-        labelsString(a.labels).localeCompare(labelsString(b.labels)),
-      )
+      .sort((a: Objective, b: Objective) => labelsString(a.labels).localeCompare(labelsString(b.labels)))
       .forEach((o: Objective) => {
-        dispatchTable({
-          type: TableActionType.SetObjective,
-          lset: labelsString(o.labels),
-          objective: o,
-        })
+        dispatchTable({type: TableActionType.SetObjective, lset: labelsString(o.labels), objective: o})
 
-        client
-          .getStatus({expr: labelsString(o.labels)})
-          .then((resp: GetStatusResponse) => {
-            if (resp.status.length === 0) {
+        api.getObjectiveStatus({expr: labelsString(o.labels)})
+          .then((s: ObjectiveStatus[]) => {
+            if (s.length === 0) {
               dispatchTable({type: TableActionType.SetStatusNone, lset: labelsString(o.labels)})
-            } else if (resp.status.length === 1) {
-              dispatchTable({
-                type: TableActionType.SetStatus,
-                lset: labelsString(o.labels),
-                status: resp.status[0],
-              })
+            } else if (s.length === 1) {
+              dispatchTable({type: TableActionType.SetStatus, lset: labelsString(o.labels), status: s[0]})
             } else {
               dispatchTable({type: TableActionType.DeleteObjective, lset: labelsString(o.labels)})
 
-              resp.status.forEach((s: ObjectiveStatus) => {
-                const so = o.clone()
+              s.forEach((s: ObjectiveStatus) => {
+                // Copy the objective
+                const so = {...o}
                 // Identify by the combined labels
                 const sLabels: Labels = s.labels !== undefined ? s.labels : {}
                 const soLabels: Labels = {...o.labels, ...sLabels}
@@ -372,7 +342,7 @@ const List = () => {
                   lset: labelsString(soLabels),
                   statusLabels: sLabels,
                   objective: so,
-                  status: s,
+                  status: s
                 })
               })
             }
@@ -387,14 +357,11 @@ const List = () => {
     //   // cancel pending requests if necessary
     //   controller.abort()
     // }
-  }, [client, objectives])
+  }, [api, objectives])
 
   const handleTableSort = (type: TableSortType): void => {
     if (tableSortState.type === type) {
-      const order =
-        tableSortState.order === TableSortOrder.Ascending
-          ? TableSortOrder.Descending
-          : TableSortOrder.Ascending
+      const order = tableSortState.order === TableSortOrder.Ascending ? TableSortOrder.Descending : TableSortOrder.Ascending
       setTableSortState({type: type, order: order})
     } else {
       setTableSortState({type: type, order: TableSortOrder.Ascending})
@@ -404,7 +371,7 @@ const List = () => {
   const tableList = Object.keys(table.objectives)
     .map((k: string) => table.objectives[k])
     .filter((o: TableObjective) => {
-      const labels = {...o.objective.labels, ...o.groupingLabels}
+      const labels = { ...o.labels, ...o.groupingLabels }
       for (const k in filterLabels) {
         // if label doesn't exist by key or if values differ filter out.
         if (labels[k] === undefined || labels[k] !== filterLabels[k]) {
@@ -414,112 +381,100 @@ const List = () => {
       return true
     })
     .sort((a: TableObjective, b: TableObjective) => {
-      // TODO: Make higher order function returning the sort function itself.
-      switch (tableSortState.type) {
-        case TableSortType.Name:
-          if (tableSortState.order === TableSortOrder.Ascending) {
-            return a.lset.localeCompare(b.lset)
-          } else {
-            return b.lset.localeCompare(a.lset)
-          }
-        case TableSortType.Window:
-          if (tableSortState.order === TableSortOrder.Ascending) {
-            return Number(a.objective.window?.seconds) - Number(b.objective.window?.seconds)
-          } else {
-            return Number(b.objective.window?.seconds) - Number(a.objective.window?.seconds)
-          }
-        case TableSortType.Objective:
-          if (tableSortState.order === TableSortOrder.Ascending) {
-            return a.objective.target - b.objective.target
-          } else {
-            return b.objective.target - a.objective.target
-          }
-        case TableSortType.Availability:
-          if (a.availability == null && b.availability != null) {
-            return 1
-          }
-          if (a.availability != null && b.availability == null) {
-            return -1
-          }
-          if (
-            a.availability !== undefined &&
-            a.availability != null &&
-            b.availability !== undefined &&
-            b.availability != null
-          ) {
+        // TODO: Make higher order function returning the sort function itself.
+        switch (tableSortState.type) {
+          case TableSortType.Name:
             if (tableSortState.order === TableSortOrder.Ascending) {
-              return a.availability.percentage - b.availability.percentage
+              return a.lset.localeCompare(b.lset)
             } else {
-              return b.availability.percentage - a.availability.percentage
+              return b.lset.localeCompare(a.lset)
             }
-          } else {
-            return 0
-          }
-        case TableSortType.Budget:
-          if (a.budget == null && b.budget != null) {
-            return 1
-          }
-          if (a.budget != null && b.budget == null) {
-            return -1
-          }
-          if (
-            a.budget !== undefined &&
-            a.budget != null &&
-            b.budget !== undefined &&
-            b.budget != null
-          ) {
+          case TableSortType.Window:
             if (tableSortState.order === TableSortOrder.Ascending) {
-              return a.budget - b.budget
+              return a.window - b.window
             } else {
-              return b.budget - a.budget
+              return b.window - a.window
             }
-          } else {
-            return 0
-          }
-        case TableSortType.Alerts:
-          if (a.severity === null && b.severity === null) {
-            return 0
-          }
-          if (a.severity === null && b.severity !== null) {
-            return 1
-          }
-          if (a.severity !== null && b.severity === null) {
-            return -1
-          }
-          if (tableSortState.order === TableSortOrder.Ascending) {
-            if (a.severity === 'critical' && b.severity === 'warning') {
+          case TableSortType.Objective:
+            if (tableSortState.order === TableSortOrder.Ascending) {
+              return a.target - b.target
+            } else {
+              return b.target - a.target
+            }
+          case TableSortType.Availability:
+            if (a.availability == null && b.availability != null) {
+              return 1
+            }
+            if (a.availability != null && b.availability == null) {
               return -1
+            }
+            if (a.availability !== undefined && a.availability != null && b.availability !== undefined && b.availability != null) {
+              if (tableSortState.order === TableSortOrder.Ascending) {
+                return a.availability.percentage - b.availability.percentage
+              } else {
+                return b.availability.percentage - a.availability.percentage
+              }
             } else {
+              return 0
+            }
+          case TableSortType.Budget:
+            if (a.budget == null && b.budget != null) {
               return 1
             }
-          } else {
-            if (a.severity === 'critical' && b.severity === 'warning') {
-              return 1
+            if (a.budget != null && b.budget == null) {
+              return -1
+            }
+            if (a.budget !== undefined && a.budget != null && b.budget !== undefined && b.budget != null) {
+              if (tableSortState.order === TableSortOrder.Ascending) {
+                return a.budget - b.budget
+              } else {
+                return b.budget - a.budget
+              }
             } else {
+              return 0
+            }
+          case TableSortType.Alerts:
+            if (a.severity === null && b.severity === null) {
+              return 0
+            }
+            if (a.severity === null && b.severity !== null) {
               return 1
             }
-          }
+            if (a.severity !== null && b.severity === null) {
+              return -1
+            }
+            if (tableSortState.order === TableSortOrder.Ascending) {
+              if (a.severity === 'critical' && b.severity === 'warning') {
+                return -1
+              } else {
+                return 1
+              }
+            } else {
+              if (a.severity === 'critical' && b.severity === 'warning') {
+                return 1
+              } else {
+                return 1
+              }
+            }
+        }
+        return 0
       }
-      return 0
-    })
+    )
 
-  const upDownIcon =
-    tableSortState.order === TableSortOrder.Ascending ? <IconArrowUp /> : <IconArrowDown />
+  const upDownIcon = tableSortState.order === TableSortOrder.Ascending ? <IconArrowUp/> : <IconArrowDown/>
 
-  const objectivePage = (labels: Labels, grouping: Labels) => {
-    return `/objectives?expr=${encodeURI(labelsString(labels))}&grouping=${encodeURI(
-      labelsString(grouping),
-    )}`
+  const objectivePage = (
+    labels: Labels,
+    grouping: Labels,
+  ) => {
+    return `/objectives?expr=${encodeURI(labelsString(labels))}&grouping=${encodeURI(labelsString(grouping))}`
   }
 
   const renderAvailability = (o: TableObjective) => {
     switch (o.state) {
       case TableObjectiveState.Unknown:
         return (
-          <Spinner
-            animation={'border'}
-            style={{width: 20, height: 20, borderWidth: 2, opacity: 0.1}}
-          />
+          <Spinner animation={'border'} style={{width: 20, height: 20, borderWidth: 2, opacity: 0.1}}/>
         )
       case TableObjectiveState.NoData:
         return <>No data</>
@@ -530,43 +485,36 @@ const List = () => {
           return <></>
         }
 
-        const volumeWarning = (1 - o.objective.target) * o.availability.total
+        const volumeWarning = ((1 - o.target) * o.availability.total)
 
-        const ls = labelsString(Object.assign({}, o.objective.labels, o.groupingLabels))
+        const ls = labelsString(Object.assign({}, o.labels, o.groupingLabels))
         return (
           <>
             <OverlayTrigger
               key={ls}
               overlay={
                 <OverlayTooltip id={`tooltip-${ls}`}>
-                  Errors: {Math.floor(o.availability.errors).toLocaleString()}
-                  <br />
+                  Errors: {Math.floor(o.availability.errors).toLocaleString()}<br/>
                   Total: {Math.floor(o.availability.total).toLocaleString()}
                 </OverlayTooltip>
               }>
-              <span className={o.availability.percentage > o.objective.target ? 'good' : 'bad'}>
+              <span className={o.availability.percentage > o.target ? 'good' : 'bad'}>
                 {(100 * o.availability.percentage).toFixed(2)}%
               </span>
             </OverlayTrigger>
-            {volumeWarning < 1 ? (
-              <>
-                <OverlayTrigger
-                  key={`${ls}-warning`}
-                  overlay={
-                    <OverlayTooltip id={`tooltip-${ls}-warning`}>
-                      Too few requests!
-                      <br />
-                      Adjust your objective or wait for events.
-                    </OverlayTooltip>
-                  }>
-                  <span className="volume-warning">
-                    <IconWarning width={20} height={20} fill="#b10d0d" />
-                  </span>
-                </OverlayTrigger>
-              </>
-            ) : (
-              <></>
-            )}
+            {volumeWarning < 1 ? <>
+              <OverlayTrigger
+                key={`${ls}-warning`}
+                overlay={
+                  <OverlayTooltip id={`tooltip-${ls}-warning`}>
+                    Too few requests!<br/>Adjust your objective or wait for events.
+                  </OverlayTooltip>
+                }>
+                <span className="volume-warning">
+                  <IconWarning width={20} height={20} fill="#b10d0d"/>
+                </span>
+              </OverlayTrigger>
+            </> : <></>}
           </>
         )
       }
@@ -577,10 +525,7 @@ const List = () => {
     switch (o.state) {
       case TableObjectiveState.Unknown:
         return (
-          <Spinner
-            animation={'border'}
-            style={{width: 20, height: 20, borderWidth: 2, opacity: 0.1}}
-          />
+          <Spinner animation={'border'} style={{width: 20, height: 20, borderWidth: 2, opacity: 0.1}}/>
         )
       case TableObjectiveState.NoData:
         return <>No data</>
@@ -591,14 +536,16 @@ const List = () => {
           return <></>
         }
         return (
-          <span className={o.budget >= 0 ? 'good' : 'bad'}>{(100 * o.budget).toFixed(2)}%</span>
+          <span className={o.budget >= 0 ? 'good' : 'bad'}>
+            {(100 * o.budget).toFixed(2)}%
+          </span>
         )
     }
   }
 
   return (
     <>
-      <Navbar />
+      <Navbar/>
       <Container className="content list">
         <Row>
           <Col>
@@ -608,147 +555,107 @@ const List = () => {
         <Row>
           <Col>
             {Object.keys(filterLabels).map((k: string) => (
-              <Button
-                variant="light"
-                size="sm"
-                className="filter-close"
-                onClick={() => removeFilterLabel(k)}>
+              <Button variant="light" size="sm" className='filter-close' onClick={() => removeFilterLabel(k)}>
                 {`${k}=${filterLabels[k]}`}
-                <span className="btn-close"></span>
+                <span className='btn-close'></span>
               </Button>
             ))}
-            <Alert show={filterError} variant="danger">
-              Your SLO filter is broken. Please reset the filter.
-            </Alert>
+            <Alert show={filterError} variant="danger">Your SLO filter is broken. Please reset the filter.</Alert>
           </Col>
         </Row>
         <Row>
           <div className="table-responsive">
             <Table hover={true}>
               <thead>
-                <tr>
-                  <th
-                    className={tableSortState.type === TableSortType.Name ? 'active' : ''}
-                    onClick={() => handleTableSort(TableSortType.Name)}>
-                    Name{' '}
-                    {tableSortState.type === TableSortType.Name ? upDownIcon : <IconArrowUpDown />}
-                  </th>
-                  <th
-                    className={tableSortState.type === TableSortType.Window ? 'active' : ''}
-                    onClick={() => handleTableSort(TableSortType.Window)}>
-                    Time Window{' '}
-                    {tableSortState.type === TableSortType.Window ? (
-                      upDownIcon
-                    ) : (
-                      <IconArrowUpDown />
-                    )}
-                  </th>
-                  <th
-                    className={tableSortState.type === TableSortType.Objective ? 'active' : ''}
-                    onClick={() => handleTableSort(TableSortType.Objective)}>
-                    Objective{' '}
-                    {tableSortState.type === TableSortType.Objective ? (
-                      upDownIcon
-                    ) : (
-                      <IconArrowUpDown />
-                    )}
-                  </th>
-                  <th
-                    className={tableSortState.type === TableSortType.Availability ? 'active' : ''}
-                    onClick={() => handleTableSort(TableSortType.Availability)}>
-                    Availability{' '}
-                    {tableSortState.type === TableSortType.Availability ? (
-                      upDownIcon
-                    ) : (
-                      <IconArrowUpDown />
-                    )}
-                  </th>
-                  <th
-                    className={tableSortState.type === TableSortType.Budget ? 'active' : ''}
-                    onClick={() => handleTableSort(TableSortType.Budget)}>
-                    Error Budget{' '}
-                    {tableSortState.type === TableSortType.Budget ? (
-                      upDownIcon
-                    ) : (
-                      <IconArrowUpDown />
-                    )}
-                  </th>
-                  <th
-                    className={tableSortState.type === TableSortType.Alerts ? 'active' : ''}
-                    onClick={() => handleTableSort(TableSortType.Alerts)}>
-                    Alerts{' '}
-                    {tableSortState.type === TableSortType.Alerts ? (
-                      upDownIcon
-                    ) : (
-                      <IconArrowUpDown />
-                    )}
-                  </th>
-                </tr>
+              <tr>
+                <th
+                  className={tableSortState.type === TableSortType.Name ? 'active' : ''}
+                  onClick={() => handleTableSort(TableSortType.Name)}>
+                  Name {tableSortState.type === TableSortType.Name ? upDownIcon : <IconArrowUpDown/>}
+                </th>
+                <th
+                  className={tableSortState.type === TableSortType.Window ? 'active' : ''}
+                  onClick={() => handleTableSort(TableSortType.Window)}>
+                  Time Window {tableSortState.type === TableSortType.Window ? upDownIcon : <IconArrowUpDown/>}
+                </th>
+                <th
+                  className={tableSortState.type === TableSortType.Objective ? 'active' : ''}
+                  onClick={() => handleTableSort(TableSortType.Objective)}>
+                  Objective {tableSortState.type === TableSortType.Objective ? upDownIcon : <IconArrowUpDown/>}
+                </th>
+                <th
+                  className={tableSortState.type === TableSortType.Availability ? 'active' : ''}
+                  onClick={() => handleTableSort(TableSortType.Availability)}>
+                  Availability {tableSortState.type === TableSortType.Availability ? upDownIcon : <IconArrowUpDown/>}
+                </th>
+                <th
+                  className={tableSortState.type === TableSortType.Budget ? 'active' : ''}
+                  onClick={() => handleTableSort(TableSortType.Budget)}>
+                  Error Budget {tableSortState.type === TableSortType.Budget ? upDownIcon : <IconArrowUpDown/>}
+                </th>
+                <th
+                  className={tableSortState.type === TableSortType.Alerts ? 'active' : ''}
+                  onClick={() => handleTableSort(TableSortType.Alerts)}>
+                  Alerts {tableSortState.type === TableSortType.Alerts ? upDownIcon : <IconArrowUpDown/>}
+                </th>
+              </tr>
               </thead>
               <tbody>
-                {tableList.map((o: TableObjective) => {
-                  const name = o.objective.labels[MetricName]
-                  const labelBadges = Object.entries({...o.objective.labels, ...o.groupingLabels})
-                    .filter((l: [string, string]) => l[0] !== MetricName)
-                    .map((l: [string, string]) => (
-                      <Badge
-                        key={l[0]}
-                        bg="light"
-                        text="dark"
-                        className="fw-normal"
-                        style={{marginRight: 5}}
-                        onClick={(event) => {
-                          event.stopPropagation()
+              {tableList.map((o: TableObjective) => {
+                const name = o.labels[MetricName]
+                const labelBadges = Object.entries({...o.labels, ...o.groupingLabels})
+                  .filter((l: [string, string]) => l[0] !== MetricName)
+                  .map((l: [string, string]) => (
+                    <Badge key={l[0]} bg="light" text="dark" className="fw-normal"
+                           style={{ marginRight: 5 }}
+                           onClick={(event) => {
+                             event.stopPropagation()
 
-                          const lset: Labels = {}
-                          lset[l[0]] = l[1]
-                          updateFilter(lset)
-                        }}>
-                        {l[0]}={l[1]}
-                      </Badge>
-                    ))
+                             const lset: Labels = {}
+                             lset[l[0]] = l[1]
+                             updateFilter(lset)
+                           }}>
+                      {l[0]}={l[1]}
+                    </Badge>
+                  ))
 
-                  const classes =
-                    o.severity !== null
-                      ? ['table-row-clickable', 'firing']
-                      : ['table-row-clickable']
+                const classes = o.severity !== null ? ['table-row-clickable', 'firing'] : ['table-row-clickable']
 
-                  return (
-                    <tr
-                      key={o.lset}
-                      className={classes.join(' ')}
-                      onClick={() => {
-                        navigate(objectivePage(o.objective.labels, o.groupingLabels))
-                      }}>
-                      <td>
-                        <Link
-                          to={objectivePage(o.objective.labels, o.groupingLabels)}
-                          className="text-reset"
-                          style={{marginRight: 5}}>
-                          {name}
-                        </Link>
-                        {labelBadges}
-                      </td>
-                      <td>{formatDuration(Number(o.objective.window?.seconds) * 1000)}</td>
-                      <td>{(100 * o.objective.target).toFixed(2)}%</td>
-                      <td>{renderAvailability(o)}</td>
-                      <td>{renderErrorBudget(o)}</td>
-                      <td>
-                        <span className="severity">{o.severity !== null ? o.severity : ''}</span>
-                      </td>
-                    </tr>
-                  )
-                })}
+                return (
+                  <tr key={o.lset} className={classes.join(' ')} onClick={() => {
+                    navigate(objectivePage(o.labels, o.groupingLabels))
+                  }}>
+                    <td>
+                      <Link to={objectivePage(o.labels, o.groupingLabels)} className="text-reset"
+                            style={{marginRight: 5}}>
+                        {name}
+                      </Link>
+                      {labelBadges}
+                    </td>
+                    <td>{formatDuration(o.window)}</td>
+                    <td>
+                      {(100 * o.target).toFixed(2)}%
+                    </td>
+                    <td>
+                      {renderAvailability(o)}
+                    </td>
+                    <td>
+                      {renderErrorBudget(o)}
+                    </td>
+                    <td>
+                      <span className="severity">{o.severity !== null ? o.severity : ''}</span>
+                    </td>
+                  </tr>
+                )
+              })}
               </tbody>
             </Table>
           </div>
         </Row>
         <Row>
           <Col>
-            <small>
-              All availabilities and error budgets are calculated across the entire time window of
-              the objective.
-            </small>
+            <small>All availabilities and error budgets are calculated across the entire time window of the
+              objective.</small>
           </Col>
         </Row>
       </Container>

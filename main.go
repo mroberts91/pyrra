@@ -3,14 +3,16 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"io/fs"
+	"io/ioutil"
 	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,7 +20,6 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
-	"github.com/bufbuild/connect-go"
 	"github.com/dgraph-io/ristretto"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
@@ -33,12 +34,10 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
-	"google.golang.org/protobuf/types/known/durationpb"
 
-	objectivesv1alpha1 "github.com/pyrra-dev/pyrra/proto/objectives/v1alpha1"
-	"github.com/pyrra-dev/pyrra/proto/objectives/v1alpha1/objectivesv1alpha1connect"
+	"github.com/pyrra-dev/pyrra/openapi"
+	openapiclient "github.com/pyrra-dev/pyrra/openapi/client"
+	openapiserver "github.com/pyrra-dev/pyrra/openapi/server/go"
 	"github.com/pyrra-dev/pyrra/slo"
 )
 
@@ -47,14 +46,12 @@ var ui embed.FS
 
 var CLI struct {
 	API struct {
-		PrometheusURL               *url.URL          `default:"http://localhost:9090" help:"The URL to the Prometheus to query."`
-		PrometheusExternalURL       *url.URL          `help:"The URL for the UI to redirect users to when opening Prometheus. If empty the same as prometheus.url"`
-		APIURL                      *url.URL          `name:"api-url" default:"http://localhost:9444" help:"The URL to the API service like a Kubernetes Operator."`
-		RoutePrefix                 string            `default:"" help:"The route prefix Pyrra uses. If run behind a proxy you can change it to something like /pyrra here."`
-		UIRoutePrefix               string            `default:"" help:"The route prefix Pyrra's UI uses. This is helpful for when the prefix is stripped by a proxy but still runs on /pyrra. Defaults to --route-prefix"`
-		PrometheusBearerTokenPath   string            `default:"" help:"Bearer token path"`
-		PrometheusBasicAuthUsername string            `default:"" help:"The HTTP basic authentication username"`
-		PrometheusBasicAuthPassword promconfig.Secret `default:"" help:"The HTTP basic authentication password"`
+		PrometheusURL             *url.URL `default:"http://localhost:9090" help:"The URL to the Prometheus to query."`
+		PrometheusExternalURL     *url.URL `help:"The URL for the UI to redirect users to when opening Prometheus. If empty the same as prometheus.url"`
+		APIURL                    *url.URL `name:"api-url" default:"http://localhost:9444" help:"The URL to the API service like a Kubernetes Operator."`
+		RoutePrefix               string   `default:"" help:"The route prefix Pyrra uses. If run behind a proxy you can change it to something like /pyrra here."`
+		UIRoutePrefix             string   `default:"" help:"The route prefix Pyrra's UI uses. This is helpful for when the prefix is stripped by a proxy but still runs on /pyrra. Defaults to --route-prefix"`
+		PrometheusBearerTokenPath string   `default:"" help:"Bearer token path"`
 	} `cmd:"" help:"Runs Pyrra's API and UI."`
 	Filesystem struct {
 		ConfigFiles      string   `default:"/etc/pyrra/*.yaml" help:"The folder where Pyrra finds the config files to use."`
@@ -92,10 +89,6 @@ func main() {
 	}
 
 	roundTripper, err := promconfig.NewRoundTripperFromConfig(promconfig.HTTPClientConfig{
-		BasicAuth: &promconfig.BasicAuth{
-			Username: CLI.API.PrometheusBasicAuthUsername,
-			Password: CLI.API.PrometheusBasicAuthPassword,
-		},
 		BearerTokenFile: CLI.API.PrometheusBearerTokenPath,
 	}, "pyrra")
 	if err != nil {
@@ -161,12 +154,24 @@ func cmdAPI(logger log.Logger, reg *prometheus.Registry, promClient api.Client, 
 	}
 	defer cache.Close()
 	promAPI := &promCache{
-		api: &promLogger{
-			api:    prometheusv1.NewAPI(promClient),
-			logger: logger,
-		},
+		api:   prometheusv1.NewAPI(promClient),
 		cache: cache,
 	}
+
+	apiConfig := openapiclient.NewConfiguration()
+	apiConfig.Scheme = apiURL.Scheme
+	apiConfig.Host = apiURL.Host
+	apiClient := openapiclient.NewAPIClient(apiConfig)
+
+	router := openapiserver.NewRouter(
+		openapiserver.NewObjectivesApiController(&ObjectivesServer{
+			logger:    logger,
+			promAPI:   promAPI,
+			apiclient: apiClient,
+		}),
+	)
+	router.Use(openapi.MiddlewareMetrics(reg))
+	router.Use(openapi.MiddlewareLogger(logger))
 
 	tmpl, err := template.ParseFS(build, "index.html")
 	if err != nil {
@@ -178,16 +183,10 @@ func cmdAPI(logger log.Logger, reg *prometheus.Registry, promClient api.Client, 
 	r.Use(cors.Handler(cors.Options{})) // TODO: Disable by default
 
 	r.Route(routePrefix, func(r chi.Router) {
-		objectiveService := &objectiveServer{
-			logger:  logger,
-			promAPI: promAPI,
-			client:  objectivesv1alpha1connect.NewObjectiveBackendServiceClient(http.DefaultClient, apiURL.String()),
-		}
-		objectivePath, objectiveHandler := objectivesv1alpha1connect.NewObjectiveServiceHandler(objectiveService)
 		if routePrefix != "/" {
-			r.Mount(objectivePath, http.StripPrefix(routePrefix, objectiveHandler))
+			r.Mount("/api/v1", http.StripPrefix(routePrefix, router))
 		} else {
-			r.Mount(objectivePath, objectiveHandler)
+			r.Mount("/api/v1", router)
 		}
 
 		r.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
@@ -199,7 +198,7 @@ func cmdAPI(logger log.Logger, reg *prometheus.Registry, promClient api.Client, 
 			}{
 				PrometheusURL: prometheusExternal.String(),
 				PathPrefix:    uiRoutePrefix,
-				APIBasepath:   uiRoutePrefix,
+				APIBasepath:   path.Join(uiRoutePrefix, "/api/v1"),
 			})
 			if err != nil {
 				level.Warn(logger).Log("msg", "failed to populate HTML template", "err", err)
@@ -215,7 +214,7 @@ func cmdAPI(logger log.Logger, reg *prometheus.Registry, promClient api.Client, 
 				}{
 					PrometheusURL: prometheusExternal.String(),
 					PathPrefix:    uiRoutePrefix,
-					APIBasepath:   uiRoutePrefix,
+					APIBasepath:   path.Join(uiRoutePrefix, "/api/v1"),
 				})
 				if err != nil {
 					level.Warn(logger).Log("msg", "failed to populate HTML template", "err", err)
@@ -237,7 +236,7 @@ func cmdAPI(logger log.Logger, reg *prometheus.Registry, promClient api.Client, 
 		})
 	}
 
-	if err := http.ListenAndServe(":9099", h2c.NewHandler(r, &http2.Server{})); err != nil {
+	if err := http.ListenAndServe(":9099", r); err != nil {
 		level.Error(logger).Log("msg", "failed to run HTTP server", "err", err)
 		return 2
 	}
@@ -262,7 +261,7 @@ func (c *thanosClient) Do(ctx context.Context, r *http.Request) (*http.Response,
 	if r.Body == nil {
 		return c.client.Do(ctx, r)
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading body: %w", err)
 	}
@@ -295,7 +294,7 @@ func (c *thanosClient) Do(ctx context.Context, r *http.Request) (*http.Response,
 	}
 
 	encoded := query.Encode()
-	r.Body = io.NopCloser(strings.NewReader(encoded))
+	r.Body = ioutil.NopCloser(strings.NewReader(encoded))
 	return c.client.Do(ctx, r)
 }
 
@@ -304,30 +303,6 @@ type prometheusAPI interface {
 	Query(ctx context.Context, query string, ts time.Time) (model.Value, prometheusv1.Warnings, error)
 	// QueryRange performs a query for the given range.
 	QueryRange(ctx context.Context, query string, r prometheusv1.Range) (model.Value, prometheusv1.Warnings, error)
-}
-
-type promLogger struct {
-	api    prometheusAPI
-	logger log.Logger
-}
-
-func (l *promLogger) Query(ctx context.Context, query string, ts time.Time) (model.Value, prometheusv1.Warnings, error) {
-	level.Debug(l.logger).Log(
-		"msg", "running instant query",
-		"query", query,
-		"ts", ts,
-	)
-	return l.api.Query(ctx, query, ts)
-}
-
-func (l *promLogger) QueryRange(ctx context.Context, query string, r prometheusv1.Range) (model.Value, prometheusv1.Warnings, error) {
-	level.Debug(l.logger).Log(
-		"msg", "running range query",
-		"query", query,
-		"start", r.Start,
-		"end", r.End,
-	)
-	return l.api.QueryRange(ctx, query, r)
 }
 
 type promCache struct {
@@ -410,57 +385,58 @@ func (p *promCache) QueryRange(ctx context.Context, query string, r prometheusv1
 	return value, warnings, nil
 }
 
-type objectiveServer struct {
-	logger  log.Logger
-	promAPI *promCache
-	client  objectivesv1alpha1connect.ObjectiveBackendServiceClient
+type ObjectivesServer struct {
+	logger    log.Logger
+	promAPI   *promCache
+	apiclient *openapiclient.APIClient
 }
 
-func (s *objectiveServer) getObjective(ctx context.Context, expr string) (slo.Objective, error) {
-	resp, err := s.client.List(ctx, connect.NewRequest(&objectivesv1alpha1.ListRequest{
-		Expr: expr,
-	}))
-	if err != nil {
-		return slo.Objective{}, err
-	}
-
-	if len(resp.Msg.Objectives) != 1 {
-		return slo.Objective{}, connect.NewError(connect.CodeAborted, fmt.Errorf("expr matches more than one SLO, it matches: %d", len(resp.Msg.Objectives)))
-	}
-
-	return objectivesv1alpha1.ToInternal(resp.Msg.Objectives[0]), nil
-}
-
-func (s *objectiveServer) List(ctx context.Context, req *connect.Request[objectivesv1alpha1.ListRequest]) (*connect.Response[objectivesv1alpha1.ListResponse], error) {
-	if expr := req.Msg.Expr; expr != "" {
-		if _, err := parser.ParseMetricSelector(expr); err != nil {
-			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("failed to parse expr: %w", err))
+func (o *ObjectivesServer) ListObjectives(ctx context.Context, query string) (openapiserver.ImplResponse, error) {
+	if query != "" {
+		// We'll parse the query matchers already to make sure it's valid before passing on to the backend.
+		if _, err := parser.ParseMetricSelector(query); err != nil {
+			return openapiserver.ImplResponse{Code: http.StatusBadRequest}, err
 		}
 	}
 
-	resp, err := s.client.List(ctx, connect.NewRequest(&objectivesv1alpha1.ListRequest{
-		Expr: req.Msg.Expr,
-	}))
+	objectives, _, err := o.apiclient.ObjectivesApi.ListObjectives(ctx).Expr(query).Execute()
 	if err != nil {
-		return nil, err
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
-	return connect.NewResponse(&objectivesv1alpha1.ListResponse{
-		Objectives: resp.Msg.Objectives,
-	}), nil
+	apiObjectives := make([]openapiserver.Objective, len(objectives))
+	for i, objective := range objectives {
+		apiObjectives[i] = openapi.ServerFromClient(objective)
+	}
+
+	return openapiserver.ImplResponse{
+		Code: http.StatusOK,
+		Body: apiObjectives,
+	}, nil
 }
 
-func (s *objectiveServer) GetStatus(ctx context.Context, req *connect.Request[objectivesv1alpha1.GetStatusRequest]) (*connect.Response[objectivesv1alpha1.GetStatusResponse], error) {
-	objective, err := s.getObjective(ctx, req.Msg.Expr)
+func (o *ObjectivesServer) GetObjectiveStatus(ctx context.Context, expr, grouping string) (openapiserver.ImplResponse, error) {
+	clientObjectives, _, err := o.apiclient.ObjectivesApi.ListObjectives(ctx).Expr(expr).Execute()
 	if err != nil {
-		return nil, err
+		var apiErr openapiclient.GenericOpenAPIError
+		if errors.As(err, &apiErr) {
+			if strings.HasPrefix(apiErr.Error(), strconv.Itoa(http.StatusNotFound)) {
+				return openapiserver.ImplResponse{Code: http.StatusNotFound}, apiErr
+			}
+		}
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
+	}
+	if len(clientObjectives) != 1 {
+		return openapiserver.ImplResponse{Code: http.StatusBadRequest}, fmt.Errorf("expr matches more than one SLO, it matches: %d", len(clientObjectives))
 	}
 
+	objective := openapi.InternalFromClient(clientObjectives[0])
+
 	// Merge grouping into objective's query
-	if req.Msg.Grouping != "" {
-		groupingMatchers, err := parser.ParseMetricSelector(req.Msg.Grouping)
+	if grouping != "" {
+		groupingMatchers, err := parser.ParseMetricSelector(grouping)
 		if err != nil {
-			return nil, connect.NewError(connect.CodeInvalidArgument, err)
+			return openapiserver.ImplResponse{}, err
 		}
 		if objective.Indicator.Ratio != nil {
 			for _, m := range groupingMatchers {
@@ -476,29 +452,27 @@ func (s *objectiveServer) GetStatus(ctx context.Context, req *connect.Request[ob
 		}
 	}
 
-	ts := time.Now()
-	if req.Msg.Time != nil {
-		ts = req.Msg.Time.AsTime()
-	}
+	ts := time.Now().UTC()
 
 	queryTotal := objective.QueryTotal(objective.Window)
-	value, _, err := s.promAPI.Query(contextSetPromCache(ctx, 15*time.Second), queryTotal, ts)
+	level.Debug(o.logger).Log("msg", "sending query total", "query", queryTotal)
+	value, _, err := o.promAPI.Query(contextSetPromCache(ctx, 15*time.Second), queryTotal, ts)
 	if err != nil {
-		level.Warn(s.logger).Log("msg", "failed to query total", "query", queryTotal, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Warn(o.logger).Log("msg", "failed to query total", "query", queryTotal, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
-	statuses := map[model.Fingerprint]*objectivesv1alpha1.ObjectiveStatus{}
+	statuses := map[model.Fingerprint]*openapiserver.ObjectiveStatus{}
 
 	for _, v := range value.(model.Vector) {
-		ls := make(map[string]string)
+		labels := make(map[string]string)
 		for k, v := range v.Metric {
-			ls[string(k)] = string(v)
+			labels[string(k)] = string(v)
 		}
 
-		statuses[v.Metric.Fingerprint()] = &objectivesv1alpha1.ObjectiveStatus{
-			Labels: ls,
-			Availability: &objectivesv1alpha1.Availability{
+		statuses[v.Metric.Fingerprint()] = &openapiserver.ObjectiveStatus{
+			Labels: labels,
+			Availability: openapiserver.ObjectiveStatusAvailability{
 				Percentage: 1,
 				Total:      float64(v.Value),
 			},
@@ -506,34 +480,21 @@ func (s *objectiveServer) GetStatus(ctx context.Context, req *connect.Request[ob
 	}
 
 	queryErrors := objective.QueryErrors(objective.Window)
-	value, _, err = s.promAPI.Query(contextSetPromCache(ctx, 15*time.Second), queryErrors, ts)
+	level.Debug(o.logger).Log("msg", "sending query errors", "query", queryErrors)
+	value, _, err = o.promAPI.Query(contextSetPromCache(ctx, 15*time.Second), queryErrors, ts)
 	if err != nil {
-		level.Warn(s.logger).Log("msg", "failed to query errors", "query", queryErrors, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Warn(o.logger).Log("msg", "failed to query errors", "query", queryErrors, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 	for _, v := range value.(model.Vector) {
-		if s, exists := statuses[v.Metric.Fingerprint()]; exists {
-			s.Availability.Errors = float64(v.Value)
-			s.Availability.Percentage = 1 - (s.Availability.Errors / s.Availability.Total)
-		} else {
-			objectiveLabels := make(map[string]string)
-			for k, v := range v.Metric {
-				objectiveLabels[string(k)] = string(v)
-			}
-
-			statuses[v.Metric.Fingerprint()] = &objectivesv1alpha1.ObjectiveStatus{
-				Labels: objectiveLabels,
-				Availability: &objectivesv1alpha1.Availability{
-					Percentage: 1 - (s.Availability.Errors / s.Availability.Total),
-					Total:      float64(v.Value),
-				},
-			}
-		}
+		s := statuses[v.Metric.Fingerprint()]
+		s.Availability.Errors = float64(v.Value)
+		s.Availability.Percentage = 1 - (s.Availability.Errors / s.Availability.Total)
 	}
 
-	statusSlice := make([]*objectivesv1alpha1.ObjectiveStatus, 0, len(statuses))
+	statusSlice := make([]openapiserver.ObjectiveStatus, 0, len(statuses))
+
 	for _, s := range statuses {
-		s.Budget = &objectivesv1alpha1.Budget{}
 		s.Budget.Total = 1 - objective.Target
 		s.Budget.Remaining = (s.Budget.Total - (s.Availability.Errors / s.Availability.Total)) / s.Budget.Total
 		s.Budget.Max = s.Budget.Total * s.Availability.Total
@@ -550,31 +511,37 @@ func (s *objectiveServer) GetStatus(ctx context.Context, req *connect.Request[ob
 			s.Budget.Remaining = 1
 		}
 
-		statusSlice = append(statusSlice, s)
+		statusSlice = append(statusSlice, *s)
 	}
 
-	return connect.NewResponse(&objectivesv1alpha1.GetStatusResponse{
-		Status: statusSlice,
-	}), nil
+	return openapiserver.ImplResponse{
+		Code: http.StatusOK,
+		Body: statusSlice,
+	}, nil
 }
 
-func (s *objectiveServer) GraphErrorBudget(ctx context.Context, req *connect.Request[objectivesv1alpha1.GraphErrorBudgetRequest]) (*connect.Response[objectivesv1alpha1.GraphErrorBudgetResponse], error) {
-	objective, err := s.getObjective(ctx, req.Msg.Expr)
+func (o *ObjectivesServer) GetObjectiveErrorBudget(ctx context.Context, expr, grouping string, startTimestamp, endTimestamp int32) (openapiserver.ImplResponse, error) {
+	clientObjectives, _, err := o.apiclient.ObjectivesApi.ListObjectives(ctx).Expr(expr).Execute()
 	if err != nil {
-		return nil, err
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
+	if len(clientObjectives) != 1 {
+		return openapiserver.ImplResponse{Code: http.StatusBadRequest}, fmt.Errorf("expr matches more than one SLO, it matches: %d", len(clientObjectives))
+	}
+	objective := openapi.InternalFromClient(clientObjectives[0])
 
-	if req.Msg.Grouping != "" && req.Msg.Grouping != "{}" {
-		groupingMatchers, err := parser.ParseMetricSelector(req.Msg.Grouping)
+	// Merge grouping into objective's query
+	if grouping != "" {
+		groupingMatchers, err := parser.ParseMetricSelector(grouping)
 		if err != nil {
-			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("failed parsing alerts metric: %w", err))
+			return openapiserver.ImplResponse{}, err
 		}
-
-		if ratio := objective.Indicator.Ratio; ratio != nil {
+		if objective.Indicator.Ratio != nil {
 			groupings := map[string]struct{}{}
-			for _, g := range ratio.Grouping {
+			for _, g := range objective.Indicator.Ratio.Grouping {
 				groupings[g] = struct{}{}
 			}
+
 			for _, m := range groupingMatchers {
 				objective.Indicator.Ratio.Errors.LabelMatchers = append(objective.Indicator.Ratio.Errors.LabelMatchers, m)
 				objective.Indicator.Ratio.Total.LabelMatchers = append(objective.Indicator.Ratio.Total.LabelMatchers, m)
@@ -598,43 +565,46 @@ func (s *objectiveServer) GraphErrorBudget(ctx context.Context, req *connect.Req
 				delete(groupings, m.Name)
 			}
 
-			objective.Indicator.Latency.Grouping = []string{}
+			objective.Indicator.Ratio.Grouping = []string{}
 			for g := range groupings {
-				objective.Indicator.Latency.Grouping = append(objective.Indicator.Latency.Grouping, g)
+				objective.Indicator.Ratio.Grouping = append(objective.Indicator.Ratio.Grouping, g)
 			}
 		}
 	}
 
-	end := time.Now()
-	start := end.Add(-1 * time.Hour)
+	now := time.Now()
+	start := now.Add(-1 * time.Hour)
+	end := now
 
-	if !req.Msg.Start.AsTime().IsZero() && !req.Msg.End.AsTime().IsZero() {
-		start = req.Msg.Start.AsTime()
-		end = req.Msg.End.AsTime()
+	if startTimestamp != 0 && endTimestamp != 0 {
+		start = time.Unix(int64(startTimestamp), 0)
+		end = time.Unix(int64(endTimestamp), 0)
 	}
+
 	step := end.Sub(start) / 1000
 
 	query := objective.QueryErrorBudget()
-	value, _, err := s.promAPI.QueryRange(contextSetPromCache(ctx, 15*time.Second), query, prometheusv1.Range{
+	level.Debug(o.logger).Log("msg", "sending query error budget", "query", query, "step", step)
+	value, _, err := o.promAPI.QueryRange(contextSetPromCache(ctx, 15*time.Second), query, prometheusv1.Range{
 		Start: start,
 		End:   end,
 		Step:  step,
 	})
 	if err != nil {
-		level.Warn(s.logger).Log("msg", "failed to query error budget", "query", query, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Warn(o.logger).Log("msg", "failed to query error budget", "query", query, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
 	matrix, ok := value.(model.Matrix)
 	if !ok {
 		err := fmt.Errorf("no matrix returned")
-		level.Debug(s.logger).Log("msg", "returned data wasn't of type matrix", "query", query, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Debug(o.logger).Log("msg", "returned data wasn't of type matrix", "query", query, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
 	if len(matrix) == 0 {
-		level.Debug(s.logger).Log("msg", "returned no data", "query", query)
-		return nil, connect.NewError(connect.CodeNotFound, nil)
+		level.Debug(o.logger).Log("msg", "returned no data", "query", query)
+		return openapiserver.ImplResponse{Code: http.StatusNotFound, Body: struct{}{}}, nil
 	}
 
 	valueLength := 0
@@ -646,31 +616,35 @@ func (s *objectiveServer) GraphErrorBudget(ctx context.Context, req *connect.Req
 
 	values := matrixToValues(matrix)
 
-	// TODO: Return Samples from above function
-	series := make([]*objectivesv1alpha1.Series, 0, len(values))
-	for _, float64s := range values {
-		series = append(series, &objectivesv1alpha1.Series{Values: float64s})
-	}
-
-	return connect.NewResponse(&objectivesv1alpha1.GraphErrorBudgetResponse{
-		Timeseries: &objectivesv1alpha1.Timeseries{
+	return openapiserver.ImplResponse{
+		Code: http.StatusOK,
+		Body: openapiserver.QueryRange{
 			Query:  query,
-			Series: series,
+			Labels: nil,
+			Values: values,
 		},
-	}), nil
+	}, nil
 }
 
-func (s *objectiveServer) GetAlerts(ctx context.Context, req *connect.Request[objectivesv1alpha1.GetAlertsRequest]) (*connect.Response[objectivesv1alpha1.GetAlertsResponse], error) {
-	resp, err := s.client.List(ctx, connect.NewRequest(&objectivesv1alpha1.ListRequest{
-		Expr: req.Msg.Expr,
-	}))
+const (
+	alertstateInactive = "inactive"
+)
+
+func (o *ObjectivesServer) GetMultiBurnrateAlerts(ctx context.Context, expr, grouping string, inactive, current bool) (openapiserver.ImplResponse, error) {
+	clientObjectives, _, err := o.apiclient.ObjectivesApi.ListObjectives(ctx).Expr(expr).Execute()
 	if err != nil {
-		return nil, err
+		var apiErr openapiclient.GenericOpenAPIError
+		if errors.As(err, &apiErr) {
+			if strings.HasPrefix(apiErr.Error(), strconv.Itoa(http.StatusNotFound)) {
+				return openapiserver.ImplResponse{Code: http.StatusNotFound}, apiErr
+			}
+		}
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
-	objectives := make([]slo.Objective, 0, len(resp.Msg.Objectives))
-	for _, o := range resp.Msg.Objectives {
-		objectives = append(objectives, objectivesv1alpha1.ToInternal(o))
+	objectives := make([]slo.Objective, 0, len(clientObjectives))
+	for _, o := range clientObjectives {
+		objectives = append(objectives, openapi.InternalFromClient(o))
 	}
 
 	// Match alerts that at least have one character for the slo name.
@@ -678,16 +652,16 @@ func (s *objectiveServer) GetAlerts(ctx context.Context, req *connect.Request[ob
 
 	var groupingMatchers []*labels.Matcher
 
-	if req.Msg.Grouping != "" && req.Msg.Grouping != "{}" {
-		expr, err := parser.ParseExpr(queryAlerts)
+	if grouping != "" && grouping != "{}" {
+		// If grouping exists we merge those matchers directly into the queryAlerts query.
+		groupingMatchers, err = parser.ParseMetricSelector(grouping)
 		if err != nil {
-			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("failed parsing alerts metric: %w", err))
+			return openapiserver.ImplResponse{}, fmt.Errorf("failed parsing grouping matchers: %w", err)
 		}
 
-		// If grouping exists we merge those matchers directly into the queryAlerts query.
-		groupingMatchers, err = parser.ParseMetricSelector(req.Msg.Grouping)
+		expr, err := parser.ParseExpr(queryAlerts)
 		if err != nil {
-			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("failed parsing grouping matchers: %w", err))
+			return openapiserver.ImplResponse{}, fmt.Errorf("failed parsing alerts metric: %w", err)
 		}
 
 		vec := expr.(*parser.VectorSelector)
@@ -701,22 +675,23 @@ func (s *objectiveServer) GetAlerts(ctx context.Context, req *connect.Request[ob
 		queryAlerts = vec.String()
 	}
 
-	value, _, err := s.promAPI.Query(contextSetPromCache(ctx, 5*time.Second), queryAlerts, time.Now())
+	level.Debug(o.logger).Log("msg", "sending query for alerts", "query", queryAlerts)
+	value, _, err := o.promAPI.Query(contextSetPromCache(ctx, 5*time.Second), queryAlerts, time.Now())
 	if err != nil {
-		level.Warn(s.logger).Log("msg", "failed to query alerts", "query", queryAlerts, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Warn(o.logger).Log("msg", "failed to query alerts", "query", queryAlerts, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
 	vector, ok := value.(model.Vector)
 	if !ok {
 		err := fmt.Errorf("no vector returned")
-		level.Debug(s.logger).Log("msg", "returned data wasn't of type vector", "query", queryAlerts, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Debug(o.logger).Log("msg", "returned data wasn't of type vector", "query", queryAlerts, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
-	alerts := alertsMatchingObjectives(vector, objectives, groupingMatchers, req.Msg.Inactive)
+	alerts := alertsMatchingObjectives(vector, objectives, groupingMatchers, inactive)
 
-	if req.Msg.Current {
+	if current {
 		for _, objective := range objectives {
 			mtx := &sync.Mutex{}
 			windowsMap := map[time.Duration]float64{}
@@ -733,24 +708,24 @@ func (s *objectiveServer) GetAlerts(ctx context.Context, req *connect.Request[ob
 
 					query, err := objective.QueryBurnrate(w, groupingMatchers)
 					if err != nil {
-						level.Warn(s.logger).Log("msg", "failed to query current burn rate", "err", err)
+						level.Warn(o.logger).Log("msg", "failed to query current burn rate", "err", err)
 						return
 					}
-					value, _, err := s.promAPI.Query(contextSetPromCache(ctx, instantCache(w)), query, time.Now())
+					value, _, err := o.promAPI.Query(contextSetPromCache(ctx, instantCache(w)), query, time.Now())
 					if err != nil {
-						level.Warn(s.logger).Log("msg", "failed to query current burn rate", "err", err)
+						level.Warn(o.logger).Log("msg", "failed to query current burn rate", "err", err)
 						return
 					}
 					vec, ok := value.(model.Vector)
 					if !ok {
-						level.Warn(s.logger).Log("msg", "failed to query current burn rate", "err", "expected vector value from Prometheus")
+						level.Warn(o.logger).Log("msg", "failed to query current burn rate", "err", "expected vector value from Prometheus")
 						return
 					}
 					if vec.Len() == 0 {
 						return
 					}
 					if vec.Len() != 1 {
-						level.Warn(s.logger).Log("msg", "failed to query current burn rate", "err", "expected vector with one value from Prometheus")
+						level.Warn(o.logger).Log("msg", "failed to query current burn rate", "err", "expected vector with one value from Prometheus")
 						return
 					}
 
@@ -776,25 +751,23 @@ func (s *objectiveServer) GetAlerts(ctx context.Context, req *connect.Request[ob
 						continue Alerts
 					}
 				}
-				short := alert.Short.Window
-				alerts[i].Short.Window = short
-				alerts[i].Short.Current = windowsMap[short.AsDuration()]
-				long := alert.Long.Window
-				alerts[i].Long.Window = long
-				alerts[i].Long.Current = windowsMap[long.AsDuration()]
+				short := time.Duration(alert.Short.Window) * time.Millisecond
+				long := time.Duration(alert.Long.Window) * time.Millisecond
+				alerts[i].Short.Current = windowsMap[short]
+				alerts[i].Long.Current = windowsMap[long]
 			}
 		}
 	}
 
-	return connect.NewResponse(&objectivesv1alpha1.GetAlertsResponse{Alerts: alerts}), nil
+	return openapiserver.ImplResponse{Code: http.StatusOK, Body: alerts}, nil
 }
 
 // alertsMatchingObjectives loops through all alerts trying to match objectives based on their labels.
 // All labels of an objective need to be equal if they exist on the ALERTS metric.
 // Therefore, only a subset on labels are taken into account
 // which gives the ALERTS metric the opportunity to include more custom labels.
-func alertsMatchingObjectives(metrics model.Vector, objectives []slo.Objective, grouping []*labels.Matcher, inactive bool) []*objectivesv1alpha1.Alert {
-	alerts := make([]*objectivesv1alpha1.Alert, 0, len(metrics))
+func alertsMatchingObjectives(metrics model.Vector, objectives []slo.Objective, grouping []*labels.Matcher, inactive bool) []openapiserver.MultiBurnrateAlert {
+	alerts := make([]openapiserver.MultiBurnrateAlert, 0, len(metrics))
 
 	if inactive {
 		for _, o := range objectives {
@@ -809,22 +782,22 @@ func alertsMatchingObjectives(metrics model.Vector, objectives []slo.Objective, 
 				queryShort, _ := o.QueryBurnrate(w.Short, grouping)
 				queryLong, _ := o.QueryBurnrate(w.Long, grouping)
 
-				alerts = append(alerts, &objectivesv1alpha1.Alert{
+				alerts = append(alerts, openapiserver.MultiBurnrateAlert{
 					Labels:   lset,
 					Severity: string(w.Severity),
-					For:      durationpb.New(w.For),
+					For:      w.For.Milliseconds(),
 					Factor:   w.Factor,
-					Short: &objectivesv1alpha1.Burnrate{
-						Window:  durationpb.New(w.Short),
+					Short: openapiserver.Burnrate{
+						Window:  w.Short.Milliseconds(),
 						Current: -1,
 						Query:   queryShort,
 					},
-					Long: &objectivesv1alpha1.Burnrate{
-						Window:  durationpb.New(w.Long),
+					Long: openapiserver.Burnrate{
+						Window:  w.Long.Milliseconds(),
 						Current: -1,
 						Query:   queryLong,
 					},
-					State: objectivesv1alpha1.Alert_inactive,
+					State: alertstateInactive,
 				})
 			}
 		}
@@ -899,23 +872,19 @@ func alertsMatchingObjectives(metrics model.Vector, objectives []slo.Objective, 
 			}
 
 			if !inactive { // If we don't include inactive we can simply append
-				alerts = append(alerts, &objectivesv1alpha1.Alert{
+				alerts = append(alerts, openapiserver.MultiBurnrateAlert{
 					Labels:   lset,
 					Severity: string(sample.Metric["severity"]),
-					State: objectivesv1alpha1.Alert_State( // Convert string to Alert_State enum
-						objectivesv1alpha1.Alert_State_value[strings.ToLower(
-							string(sample.Metric["alertstate"]),
-						)],
-					),
-					For:    durationpb.New(window.For),
-					Factor: window.Factor,
-					Short: &objectivesv1alpha1.Burnrate{
-						Window:  durationpb.New(time.Duration(short)),
+					State:    string(sample.Metric["alertstate"]),
+					For:      window.For.Milliseconds(),
+					Factor:   window.Factor,
+					Short: openapiserver.Burnrate{
+						Window:  time.Duration(short).Milliseconds(),
 						Current: -1,
 						Query:   o.Burnrate(time.Duration(short)),
 					},
-					Long: &objectivesv1alpha1.Burnrate{
-						Window:  durationpb.New(time.Duration(long)),
+					Long: openapiserver.Burnrate{
+						Window:  time.Duration(long).Milliseconds(),
 						Current: -1,
 						Query:   o.Burnrate(time.Duration(long)),
 					},
@@ -928,20 +897,15 @@ func alertsMatchingObjectives(metrics model.Vector, objectives []slo.Objective, 
 							continue alerts
 						}
 					}
-
 					// only continues here if all labels match
-					if alert.Short.Window.AsDuration() != time.Duration(short) {
+					if alert.Short.Window != time.Duration(short).Milliseconds() {
 						continue alerts
 					}
-					if alert.Long.Window.AsDuration() != time.Duration(long) {
+					if alert.Long.Window != time.Duration(long).Milliseconds() {
 						continue alerts
 					}
 					// only update state for exact short and long burn rate match
-					alerts[i].State = objectivesv1alpha1.Alert_State( // Convert string to Alert_State enum
-						objectivesv1alpha1.Alert_State_value[strings.ToLower(
-							string(sample.Metric["alertstate"]),
-						)],
-					)
+					alerts[i].State = string(sample.Metric["alertstate"])
 				}
 			}
 		}
@@ -950,17 +914,21 @@ func alertsMatchingObjectives(metrics model.Vector, objectives []slo.Objective, 
 	return alerts
 }
 
-func (s *objectiveServer) GraphRate(ctx context.Context, req *connect.Request[objectivesv1alpha1.GraphRateRequest]) (*connect.Response[objectivesv1alpha1.GraphRateResponse], error) {
-	objective, err := s.getObjective(ctx, req.Msg.Expr)
+func (o *ObjectivesServer) GetREDRequests(ctx context.Context, expr, grouping string, startTimestamp, endTimestamp int32) (openapiserver.ImplResponse, error) {
+	clientObjectives, _, err := o.apiclient.ObjectivesApi.ListObjectives(ctx).Expr(expr).Execute()
 	if err != nil {
-		return nil, err
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
+	if len(clientObjectives) != 1 {
+		return openapiserver.ImplResponse{Code: http.StatusBadRequest}, fmt.Errorf("expr matches not exactly one SLO")
+	}
+	objective := openapi.InternalFromClient(clientObjectives[0])
 
 	// Merge grouping into objective's query
-	if req.Msg.Grouping != "" {
-		groupingMatchers, err := parser.ParseMetricSelector(req.Msg.Grouping)
+	if grouping != "" {
+		groupingMatchers, err := parser.ParseMetricSelector(grouping)
 		if err != nil {
-			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("failed to parse expr: %w", err))
+			return openapiserver.ImplResponse{}, err
 		}
 		if objective.Indicator.Ratio != nil {
 			for _, m := range groupingMatchers {
@@ -976,12 +944,13 @@ func (s *objectiveServer) GraphRate(ctx context.Context, req *connect.Request[ob
 		}
 	}
 
-	end := time.Now()
-	start := end.Add(-1 * time.Hour)
+	now := time.Now()
+	start := now.Add(-1 * time.Hour)
+	end := now
 
-	if !req.Msg.Start.AsTime().IsZero() && !req.Msg.End.AsTime().IsZero() {
-		start = req.Msg.Start.AsTime()
-		end = req.Msg.End.AsTime()
+	if startTimestamp != 0 && endTimestamp != 0 {
+		start = time.Unix(int64(startTimestamp), 0)
+		end = time.Unix(int64(endTimestamp), 0)
 	}
 	step := end.Sub(start) / 1000
 
@@ -989,33 +958,34 @@ func (s *objectiveServer) GraphRate(ctx context.Context, req *connect.Request[ob
 	cacheDuration := rangeCache(start, end)
 
 	query := objective.RequestRange(timeRange)
+	level.Debug(o.logger).Log("msg", "running range request", "query", query)
 
-	value, _, err := s.promAPI.QueryRange(contextSetPromCache(ctx, cacheDuration), query, prometheusv1.Range{
+	value, _, err := o.promAPI.QueryRange(contextSetPromCache(ctx, cacheDuration), query, prometheusv1.Range{
 		Start: start,
 		End:   end,
 		Step:  step,
 	})
 	if err != nil {
-		level.Warn(s.logger).Log("msg", "failed to run range request", "query", query, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Warn(o.logger).Log("msg", "failed to run range request", "query", query, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
 	if value.Type() != model.ValMatrix {
 		err := fmt.Errorf("returned data is not a matrix")
-		level.Warn(s.logger).Log("query", query, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Warn(o.logger).Log("query", query, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
 	matrix, ok := value.(model.Matrix)
 	if !ok {
 		err := fmt.Errorf("no matrix returned")
-		level.Warn(s.logger).Log("query", query, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Warn(o.logger).Log("query", query, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
 	if len(matrix) == 0 {
-		level.Debug(s.logger).Log("msg", "no data returned", "query", query)
-		return nil, connect.NewError(connect.CodeNotFound, err)
+		level.Debug(o.logger).Log("msg", "no data returned", "query", query)
+		return openapiserver.ImplResponse{Code: http.StatusNotFound, Body: struct{}{}}, nil
 	}
 
 	valueLength := 0
@@ -1024,6 +994,7 @@ func (s *objectiveServer) GraphRate(ctx context.Context, req *connect.Request[ob
 			valueLength = len(m.Values)
 		}
 	}
+
 	labels := make([]string, len(matrix))
 	for i, stream := range matrix {
 		labels[i] = model.LabelSet(stream.Metric).String()
@@ -1031,32 +1002,31 @@ func (s *objectiveServer) GraphRate(ctx context.Context, req *connect.Request[ob
 
 	values := matrixToValues(matrix)
 
-	// TODO: Return Samples from above function
-	series := make([]*objectivesv1alpha1.Series, 0, len(values))
-	for _, float64s := range values {
-		series = append(series, &objectivesv1alpha1.Series{Values: float64s})
-	}
-
-	return connect.NewResponse(&objectivesv1alpha1.GraphRateResponse{
-		Timeseries: &objectivesv1alpha1.Timeseries{
-			Labels: labels,
+	return openapiserver.ImplResponse{
+		Code: http.StatusOK,
+		Body: openapiserver.QueryRange{
 			Query:  query,
-			Series: series,
+			Labels: labels,
+			Values: values,
 		},
-	}), nil
+	}, nil
 }
 
-func (s *objectiveServer) GraphErrors(ctx context.Context, req *connect.Request[objectivesv1alpha1.GraphErrorsRequest]) (*connect.Response[objectivesv1alpha1.GraphErrorsResponse], error) {
-	objective, err := s.getObjective(ctx, req.Msg.Expr)
+func (o *ObjectivesServer) GetREDErrors(ctx context.Context, expr, grouping string, startTimestamp, endTimestamp int32) (openapiserver.ImplResponse, error) {
+	clientObjectives, _, err := o.apiclient.ObjectivesApi.ListObjectives(ctx).Expr(expr).Execute()
 	if err != nil {
-		return nil, err
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
+	if len(clientObjectives) != 1 {
+		return openapiserver.ImplResponse{Code: http.StatusBadRequest}, fmt.Errorf("expr matches not exactly one SLO")
+	}
+	objective := openapi.InternalFromClient(clientObjectives[0])
 
 	// Merge grouping into objective's query
-	if req.Msg.Grouping != "" {
-		groupingMatchers, err := parser.ParseMetricSelector(req.Msg.Grouping)
+	if grouping != "" {
+		groupingMatchers, err := parser.ParseMetricSelector(grouping)
 		if err != nil {
-			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("failed to parse expr: %w", err))
+			return openapiserver.ImplResponse{}, err
 		}
 		if objective.Indicator.Ratio != nil {
 			for _, m := range groupingMatchers {
@@ -1072,12 +1042,13 @@ func (s *objectiveServer) GraphErrors(ctx context.Context, req *connect.Request[
 		}
 	}
 
-	end := time.Now()
-	start := end.Add(-1 * time.Hour)
+	now := time.Now()
+	start := now.Add(-1 * time.Hour)
+	end := now
 
-	if !req.Msg.Start.AsTime().IsZero() && !req.Msg.End.AsTime().IsZero() {
-		start = req.Msg.Start.AsTime()
-		end = req.Msg.End.AsTime()
+	if startTimestamp != 0 && endTimestamp != 0 {
+		start = time.Unix(int64(startTimestamp), 0)
+		end = time.Unix(int64(endTimestamp), 0)
 	}
 	step := end.Sub(start) / 1000
 
@@ -1085,32 +1056,34 @@ func (s *objectiveServer) GraphErrors(ctx context.Context, req *connect.Request[
 	cacheDuration := rangeCache(start, end)
 
 	query := objective.ErrorsRange(timeRange)
-	value, _, err := s.promAPI.QueryRange(contextSetPromCache(ctx, cacheDuration), query, prometheusv1.Range{
+	level.Debug(o.logger).Log("msg", "running error request", "query", query)
+
+	value, _, err := o.promAPI.QueryRange(contextSetPromCache(ctx, cacheDuration), query, prometheusv1.Range{
 		Start: start,
 		End:   end,
 		Step:  step,
 	})
 	if err != nil {
-		level.Warn(s.logger).Log("msg", "failed to run range error request", "query", query, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Warn(o.logger).Log("msg", "failed to run range error request", "query", query, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
 	if value.Type() != model.ValMatrix {
 		err := fmt.Errorf("returned data is not a matrix")
-		level.Warn(s.logger).Log("query", query, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Warn(o.logger).Log("query", query, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
 	matrix, ok := value.(model.Matrix)
 	if !ok {
 		err := fmt.Errorf("no matrix returned")
-		level.Warn(s.logger).Log("query", query, "err", err)
-		return nil, connect.NewError(connect.CodeInternal, err)
+		level.Warn(o.logger).Log("query", query, "err", err)
+		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
 	}
 
 	if len(matrix) == 0 {
-		level.Debug(s.logger).Log("msg", "no data returned", "query", query)
-		return nil, connect.NewError(connect.CodeNotFound, err)
+		level.Debug(o.logger).Log("msg", "no data returned", "query", query)
+		return openapiserver.ImplResponse{Code: http.StatusNotFound, Body: struct{}{}}, nil
 	}
 
 	valueLength := 0
@@ -1127,19 +1100,14 @@ func (s *objectiveServer) GraphErrors(ctx context.Context, req *connect.Request[
 
 	values := matrixToValues(matrix)
 
-	// TODO: Return Samples from above function
-	series := make([]*objectivesv1alpha1.Series, 0, len(values))
-	for _, float64s := range values {
-		series = append(series, &objectivesv1alpha1.Series{Values: float64s})
-	}
-
-	return connect.NewResponse(&objectivesv1alpha1.GraphErrorsResponse{
-		Timeseries: &objectivesv1alpha1.Timeseries{
-			Labels: labels,
+	return openapiserver.ImplResponse{
+		Code: http.StatusOK,
+		Body: openapiserver.QueryRange{
 			Query:  query,
-			Series: series,
+			Labels: labels,
+			Values: values,
 		},
-	}), nil
+	}, nil
 }
 
 const (

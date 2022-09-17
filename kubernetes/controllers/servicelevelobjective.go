@@ -19,7 +19,6 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"time"
 
 	kitlog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -70,25 +69,6 @@ func (r *ServiceLevelObjectiveReconciler) reconcilePrometheusRule(ctx context.Co
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-
-	level.Info(logger).Log("msg", "Attempting to get rule before sleep")
-	var beforeRule monitoringv1.PrometheusRule
-	if err := r.Get(ctx, req.NamespacedName, &beforeRule); err != nil {
-		level.Info(logger).Log("msg", "Get Rule Before Sleep", "namespace", beforeRule.GetNamespace(), "name", beforeRule.GetName())
-		if errors.IsNotFound(err) {
-			level.Error(logger).Log("msg", "Rule Before Sleep", "namespace", beforeRule.GetNamespace(), "name", beforeRule.GetName())
-	}
-
-	time.Sleep(10 * time.Second)
-
-	level.Info(logger).Log("msg", "Attempting to get rule after sleep")
-	var afterRule monitoringv1.PrometheusRule
-	if err := r.Get(ctx, req.NamespacedName, &afterRule); err != nil {
-		level.Info(logger).Log("msg", "Get Rule After Sleep", "namespace", afterRule.GetNamespace(), "name", afterRule.GetName())
-		if errors.IsNotFound(err) {
-			level.Error(logger).Log("msg", "Rule After Sleep", "namespace", afterRule.GetNamespace(), "name", afterRule.GetName())
-	}
-
 
 	var rule monitoringv1.PrometheusRule
 	if err := r.Get(ctx, req.NamespacedName, &rule); err != nil {
